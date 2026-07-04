@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>T7 Emblem Upload Portal</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            padding: 40px;
+            text-align: center;
+            background-color: #f9f9f9;
+        }
+        .upload-container {
+            max-width: 480px;
+            margin: 0 auto;
+            background: white;
+            padding: 30px;
+            border-radius: 8px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+        .upload-btn {
+            background: #007bff;
+            color: white;
+            padding: 12px 24px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+            width: 100%;
+            margin-top: 15px;
+        }
+        .upload-btn:hover { background: #0056b3; }
+        .upload-btn:disabled {
+            background: #8bbce8;
+            cursor: not-allowed;
+        }
+        #status {
+            margin-top: 15px;
+            font-weight: bold;
+            color: #333;
+            white-space: pre-wrap;
+            text-align: left;
+        }
+        .status-ok { color: #137333; }
+        .status-error { color: #b00020; }
+        .status-info { color: #333; }
+        .small-note {
+            margin-top: 12px;
+            font-size: 12px;
+            color: #666;
+            line-height: 1.35;
+        }
+    </style>
+</head>
+<body>
+
+    <div class="upload-container">
+        <h2>Submit .emblem Files</h2>
+        <p>Select your files below to upload directly to Google Drive.</p>
+        <input type="file" id="fileInput" accept=".emblem" multiple>
+        <button class="upload-btn" id="uploadBtn" onclick="upload()">Upload File</button>
+
+        <p style="margin-top: 15px; font-size: 14px;">
+            <a href="https://drive.google.com/drive/folders/1NAZmB1OiZyUpZH7MBbB4RCw_Kq5I7dWQ" target="_blank" style="color: #007bff; text-decoration: none; font-weight: bold;">
+                📁 View Uploaded Files in Google Drive
+            </a>
+        </p>
+
+        <p id="status" class="status-info"></p>
+    </div>
+
+    <script>
+      const WEB_APP_URL = "https://script.google.com/macros/s/AKfycbyQD7ZE9_TBU6tSM5fmFGWxq9L5qQjHcui_ZQpvMYQTX8qvA9kRVHBPnxGSzSzDnfIn/exec";
+      const EMBLEM_HEADER_SIZE = 0x18;
+      const T7_EMBLEM_VERSION = 1;
+      const T7_EMBLEM_MAGIC = [0x54, 0x37, 0x45, 0x4D, 0x42, 0x4C, 0x4D, 0x00]; // T7EMBLM\0
+      const MAX_NAME_LENGTH = 255;
+
+      function setStatus(message, type = "info") {
+        const statusEl = document.getElementById("status");
+        statusEl.innerText = message;
+        statusEl.className = type === "ok" ? "status-ok" : type === "error" ? "status-error" : "status-info";
+      }
+
+      function crc32Update(crc, bytes) {
+        crc = (~crc) >>> 0;
+
+        for (let i = 0; i < bytes.length; i++) {
+          crc = (crc ^ bytes[i]) >>> 0;
+
+          for (let bit = 0; bit < 8; bit++) {
+            const mask = -(crc & 1);
+            crc = ((crc >>> 1) ^ (0xEDB88320 & mask)) >>> 0;
+          }
+        }
+
+        return (~crc) >>> 0;
+      }
+
+      function crc32EmblemPayload(nameBytes, emblemBytes) {
+        let crc = 0;
+        crc = crc32Update(crc, nameBytes);
+        crc = crc32Update(crc, emblemBytes);
+        return crc >>> 0;
+      }
+
+      function formatHex32(value) {
+        return "0x" + (value >>> 0).toString(16).toUpperCase().padStart(8, "0");
+      }
+
+      function validateEmblemBuffer(fileName, buffer) {
+        const bytes = new Uint8Array(buffer);
+
+        if (!fileName.toLowerCase().endsWith(".emblem")) {
+          return { ok: false, reason: "File extension must be .emblem." };
+        }
+
+        if (bytes.length < EMBLEM_HEADER_SIZE) {
+          return { ok: false, reason: `File is too small. Minimum size is ${EMBLEM_HEADER_SIZE} bytes.` };
+        }
+
+        for (let i = 0; i < T7_EMBLEM_MAGIC.length; i++) {
+          if (bytes[i] !== T7_EMBLEM_MAGIC[i]) {
+            return { ok: false, reason: "Invalid magic." };
+          }
+        }
+
+        const view = new DataView(buffer);
+        const version = view.getUint32(0x08, true);
+        const emblemSize = view.getUint32(0x0C, true);
+        const nameLength = view.getUint32(0x10, true);
+        const expectedCrc = view.getUint32(0x14, true);
+
+        if (version !== T7_EMBLEM_VERSION) {
+          return { ok: false, reason: `Unsupported version` };
+        }
+
+        if (nameLength > MAX_NAME_LENGTH) {
+          return { ok: false, reason: `Name is too long (${nameLength} bytes).` };
+        }
+
+        if (emblemSize === 0) {
+          return { ok: false, reason: "emblemSize is zero." };
+        }
+
+        const expectedFileSize = EMBLEM_HEADER_SIZE + nameLength + emblemSize;
+
+        if (bytes.length !== expectedFileSize) {
+          return {
+            ok: false,
+            reason: `Invalid file size.`
+          };
+        }
+
+        const nameStart = EMBLEM_HEADER_SIZE;
+        const nameEnd = nameStart + nameLength;
+        const emblemStart = nameEnd;
+        const emblemEnd = emblemStart + emblemSize;
+
+        const nameBytes = bytes.slice(nameStart, nameEnd);
+        const emblemBytes = bytes.slice(emblemStart, emblemEnd);
+        const actualCrc = crc32EmblemPayload(nameBytes, emblemBytes);
+
+        if (actualCrc !== expectedCrc) {
+          return {
+            ok: false,
+            reason: `CRC mismatch.`
+          };
+        }
+
+        let emblemName = "";
+        if (nameBytes.length > 0) {
+          try {
+            emblemName = new TextDecoder("utf-8", { fatal: false }).decode(nameBytes);
+          } catch {
+            emblemName = "";
+          }
+        }
+
+        return {
+          ok: true,
+          version,
+          emblemSize,
+          nameLength,
+          crc32: actualCrc,
+          emblemName,
+          bytes
+        };
+      }
+
+      async function upload() {
+        const fileInput = document.getElementById("fileInput");
+        const uploadBtn = document.getElementById("uploadBtn");
+
+        if (fileInput.files.length === 0) {
+          alert("Please select at least one file.");
+          return;
+        }
+
+        const files = Array.from(fileInput.files);
+        const validatedFiles = [];
+
+        uploadBtn.disabled = true;
+
+        try {
+          setStatus(`Validating ${files.length} file(s)...`);
+
+          for (const file of files) {
+            const buffer = await file.arrayBuffer();
+            const validation = validateEmblemBuffer(file.name, buffer);
+
+            if (!validation.ok) {
+              setStatus(`Invalid file: ${file.name}\n${validation.reason}`, "error");
+              uploadBtn.disabled = false;
+              return;
+            }
+
+            validatedFiles.push({
+              file,
+              buffer,
+              validation
+            });
+          }
+
+          setStatus(`Starting upload...`, "ok");
+
+          let uploadedCount = 0;
+
+          for (const item of validatedFiles) {
+            const { file, validation } = item;
+
+            const displayName = validation.emblemName ? `${validation.emblemName} (${file.name})` : file.name;
+            setStatus(`Uploading: ${displayName}...`);
+
+            const fileObj = {
+              filename: file.name,
+              mimeType: file.type || "application/octet-stream",
+              emblemName: validation.emblemName,
+              emblemSize: validation.emblemSize,
+              crc32: formatHex32(validation.crc32),
+              bytes: Array.from(validation.bytes)
+            };
+
+            const response = await fetch(WEB_APP_URL, {
+              method: "POST",
+              body: JSON.stringify(fileObj)
+            });
+
+            if (!response.ok) {
+              throw new Error(`Upload failed for ${file.name}. HTTP ${response.status}`);
+            }
+
+            await response.text();
+
+            uploadedCount++;
+            setStatus(`Uploaded (${uploadedCount}/${files.length})...`, "ok");
+          }
+
+          setStatus(`Success! All ${files.length} valid .emblem file(s) uploaded safely.`, "ok");
+          fileInput.value = "";
+        } catch (err) {
+          console.error(err);
+          setStatus(`Upload error: ${err.message || err}`, "error");
+        } finally {
+          uploadBtn.disabled = false;
+        }
+      }
+    </script>
+</body>
+</html>
